@@ -127,3 +127,13 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Video and danmaku files
+.mp4
+.flv
+.xml
+.ass
+recordings/
+clips/
+
+
