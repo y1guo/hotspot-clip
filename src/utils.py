@@ -6,6 +6,7 @@ import ffmpeg
 import json
 import lxml.etree as ET
 import pandas as pd
+from collections import Counter
 
 
 class DanmakuPool:
@@ -24,32 +25,143 @@ class DanmakuPool:
             ]
         )
 
-    def add_danmaku(self, danmaku: dict) -> None:
-        """Add a danmaku to the pool.
+    # def add_danmaku(self, danmaku: dict) -> None:
+    #     """Add a danmaku to the pool.
+
+    #     Parameters:
+    #         danmaku: A dictionary of danmaku attributes:
+
+    #             time: Danmaku timestamp, timestamp, example: 1680514935.055
+
+    #             offset: display time offset w.r.t. the timestamp, float, example: 1.214, -2.089
+
+    #             roomid: room id, string, example: "92613"
+
+    #             uid: user id, string, example: "74354088"
+
+    #             uname: user name, string, example: "ymyyg"
+
+    #             color: color, int, example: 16777215
+
+    #             price: price in CNY if superchat, int, example: 0
+
+    #             text: danmaku text, example: "233333"
+
+    #     Returns:
+    #         None
+    #     """
+    #     self.df = pd.concat([self.df, pd.DataFrame([danmaku])], ignore_index=True)
+
+    def add_danmaku_from_xml(self, file_path: str) -> None:
+        """Add danmaku to the pool from xml file.
+
+        The xml file is expected to have a <BililiveRecorderRecordInfo> tag with metadata, a <d> tag for each danmaku and
+        a <sc> tag for each superchat.
+
+        The <BiliLiveRecorderRecordInfo> tag is expected to have the following attributes:
+
+            roomid: room id
+
+            shortid: short room id
+
+            name: streamer username
+
+            title: stream title
+
+            areanameparent: area the live belongs to, example: "PC/Console Games", "Online Games", "Entertainment"
+
+            areanamechild: subarea the live belongs to, example: "FPS", "Mobile Games", "Variety"
+
+            start_time: start time of the recording, example: "2023-04-03T02:42:13.8005156-07:00"
+
+        The <d> tag is expected to have a "p" attribute with the following format, separated by commas:
+
+            example: p="3.090,1,25,4546550,1658318972567,0,81658411,0"
+
+            p[0] = 3.090: video time offset
+
+            p[1] = 1: player mode (danmaku location, 1=right to left, 3=top, 4=bottom)
+
+            p[2] = 25: font size (seems to be always 25)
+
+            p[3] = 4546550: color
+
+            p[4] = 1658318972567: timestamp
+
+            p[5] = 0: unknown (seems to be always zero)
+
+            p[6] = 81658411: uid
+
+            p[7] = 0: unknown (seems to be always zero)
+
+        a "user" attribute with the username and the text is the danmaku.
+
+        The <sc> tag is expected to have the following attributes:
+
+            ts: video time offset
+
+            user: username
+
+            uid: uid
+
+            price: superchat price
+
+            time: superchat duration
+
+        And the text is the danmaku.
 
         Parameters:
-            danmaku: A dictionary of danmaku attributes:
-
-                time: Danmaku timestamp, example: 1680514935.055
-
-                offset: display time offset w.r.t. the timestamp, example: 1.214, -2.089
-
-                roomid: room id, example: 92613
-
-                uid: user id, example: 74354088
-
-                uname: user name, example: "ymyyg"
-
-                color: color, example: 16777215
-
-                price: price in CNY if superchat, example: 0
-
-                text: danmaku text, example: "233333"
-
-        Returns:
-            None
+            file_path: Path to the file.
         """
-        self.df.loc[len(self.df)] = danmaku
+        try:
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            info = root.find("BililiveRecorderRecordInfo")
+            roomid = info.attrib["roomid"]
+            start_time = parse_Bilirec_time(info.attrib["start_time"]).timestamp()
+            danmaku = {
+                "time": [],
+                "offset": [],
+                "roomid": [],
+                "uid": [],
+                "uname": [],
+                "color": [],
+                "price": [],
+                "text": [],
+            }
+            for child in root.findall("d"):
+                p = child.attrib["p"].split(",")
+                danmaku["time"].append(float(p[4]) * 1e-3)
+                danmaku["offset"].append(start_time + float(p[0]) - float(p[4]) * 1e-3)
+                danmaku["roomid"].append(roomid)
+                danmaku["uid"].append(p[6])
+                danmaku["uname"].append(child.attrib["user"])
+                danmaku["color"].append(int(p[3]))
+                danmaku["price"].append(0)
+                danmaku["text"].append(child.text)
+            for child in root.findall("sc"):
+                danmaku["time"].append(start_time + float(p[0]))
+                danmaku["offset"].append(0)
+                danmaku["roomid"].append(roomid)
+                danmaku["uid"].append(child.attrib["uid"])
+                danmaku["uname"].append(child.attrib["user"])
+                danmaku["color"].append(16772431)
+                danmaku["price"].append(int(child.attrib["price"]))
+                danmaku["text"].append(child.text)
+            self.df = pd.concat([self.df, pd.DataFrame(danmaku)], ignore_index=True)
+        except:
+            print("Error: load_danmaku failed, file =", file_path, file=sys.stderr)
+
+    def blacklist_filter(self, blacklist: dict[str, list]) -> None:
+        """Filter danmaku by blacklist.
+
+        Parameters:
+
+            blacklist: Dictionary of blacklists. The key is the room id, and the value is a list of banned danmaku.
+            Example: {"123456": ["banned danmaku 1", "banned danmaku 2"], "654321": ["banned danmaku 3"]}
+        """
+        for roomid in blacklist:
+            self.df = self.df[~self.df["roomid"].eq(roomid) | ~self.df["text"].isin(blacklist[roomid])]
 
 
 def parse_Bilirec_time(time_str: str) -> datetime.datetime:
@@ -173,108 +285,27 @@ def get_duration_inconsistency(video_path: str) -> tuple[float, float]:
     )
 
 
-def load_danmaku(file_path: str, pool: DanmakuPool) -> DanmakuPool:
-    """Load danmaku from the xml file.
-
-    The xml file is expected to have a <BililiveRecorderRecordInfo> tag with metadata, a <d> tag for each danmaku and
-    a <sc> tag for each superchat.
-
-    The <BiliLiveRecorderRecordInfo> tag is expected to have the following attributes:
-
-        roomid: room id
-
-        shortid: short room id
-
-        name: streamer username
-
-        title: stream title
-
-        areanameparent: area the live belongs to, example: "PC/Console Games", "Online Games", "Entertainment"
-
-        areanamechild: subarea the live belongs to, example: "FPS", "Mobile Games", "Variety"
-
-        start_time: start time of the recording, example: "2023-04-03T02:42:13.8005156-07:00"
-
-    The <d> tag is expected to have a "p" attribute with the following format, separated by commas:
-
-        example: p="3.090,1,25,4546550,1658318972567,0,81658411,0"
-
-        p[0] = 3.090: video time offset
-
-        p[1] = 1: player mode (danmaku location, 1=right to left, 3=top, 4=bottom)
-
-        p[2] = 25: font size (seems to be always 25)
-
-        p[3] = 4546550: color
-
-        p[4] = 1658318972567: timestamp
-
-        p[5] = 0: unknown (seems to be always zero)
-
-        p[6] = 81658411: uid
-
-        p[7] = 0: unknown (seems to be always zero)
-
-    a "user" attribute with the username and the text is the danmaku.
-
-    The <sc> tag is expected to have the following attributes:
-
-        ts: video time offset
-
-        user: username
-
-        uid: uid
-
-        price: superchat price
-
-        time: superchat duration
-
-    And the text is the danmaku.
+def examine_danmaku(pool: DanmakuPool, top_num: int = 50) -> None:
+    """Show the most frequent danmaku in the pool.
 
     Parameters:
-        file_path: Path to the file.
-        pool: DanmakuPool to be loaded into.
 
-    Returns:
-        DanmakuPool.
+        df: DataFrame containing the danmaku pool.
+
+        top_num: Number of danmaku to show. Default is 50.
     """
-    try:
-        tree = ET.parse(file_path)
-        root = tree.getroot()
-        info = root.find("BililiveRecorderRecordInfo")
-        roomid = int(info.attrib["roomid"])
-        start_time = parse_Bilirec_time(info.attrib["start_time"]).timestamp()
-        for child in root.findall("d"):
-            danmaku = {}
-            p = child.attrib["p"].split(",")
-            danmaku["time"] = float(p[4]) * 1e-3
-            danmaku["offset"] = start_time + float(p[0]) - danmaku["time"]
-            danmaku["roomid"] = roomid
-            danmaku["uid"] = int(p[6])
-            danmaku["uname"] = child.attrib["user"]
-            danmaku["color"] = int(p[3])
-            danmaku["price"] = 0
-            danmaku["text"] = child.text
-            pool.add_danmaku(danmaku)
-        for child in root.findall("sc"):
-            danmaku = {}
-            danmaku["time"] = start_time + float(p[0])
-            danmaku["offset"] = 0
-            danmaku["roomid"] = roomid
-            danmaku["uid"] = int(child.attrib["uid"])
-            danmaku["uname"] = child.attrib["user"]
-            danmaku["color"] = 16772431
-            danmaku["price"] = int(child.attrib["price"])
-            danmaku["text"] = child.text
-            pool.add_danmaku(danmaku)
-    except:
-        print("Error: load_danmaku failed, file =", file_path, file=sys.stderr)
-        return pool
-
-
-def blacklist_filter(pool: DanmakuPool) -> DanmakuPool:
-    # to do
-    return pool
+    stats = {}
+    for i in range(len(pool.df)):
+        danmaku = pool.df.iloc[i]
+        roomid = danmaku["roomid"]
+        text = danmaku["text"]
+        if roomid not in stats:
+            stats[roomid] = Counter()
+        stats[roomid].update({text: 1})
+    for roomid, counter in stats.items():
+        print(f"Room ID: {roomid}")
+        for text, count in counter.most_common(top_num):
+            print(f"{count:>6} {text}")
 
 
 # load config
@@ -282,3 +313,4 @@ with open("config.json", "r") as f:
     config = json.load(f)
     TIMEZONE = pytz.timezone(config["timezone"])
     BLACKLIST = config["blacklist"]
+    AVERAGE_DURATION = config["average_duration"]
