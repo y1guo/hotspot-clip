@@ -77,5 +77,8 @@
             "很有精神"
         ]
     },
-    "average_duration": 15
+    "smoothing_window": 15,
+    "time_backward": 50,
+    "time_afterward": 15,
+    "kernel_sigma": 10
 }

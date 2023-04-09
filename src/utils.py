@@ -1,29 +1,38 @@
+from __future__ import annotations
 import os
 import sys
 import datetime
 import pytz
 import ffmpeg
 import json
+import math
 import lxml.etree as ET
 import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
 from collections import Counter
+from copy import deepcopy
+from scipy.optimize import minimize
 
 
 class DanmakuPool:
-    def __init__(self) -> None:
+    def __init__(self, df: pd.DataFrame = None) -> None:
         # initialize empty data frame
-        self.df = pd.DataFrame(
-            columns=[
-                "time",
-                "offset",
-                "roomid",
-                "uid",
-                "uname",
-                "color",
-                "price",
-                "text",
-            ]
-        )
+        if df is None:
+            self.df = pd.DataFrame(
+                columns=[
+                    "time",
+                    "offset",
+                    "roomid",
+                    "uid",
+                    "uname",
+                    "color",
+                    "price",
+                    "text",
+                ]
+            )
+        else:
+            self.df = deepcopy(df)
 
     # def add_danmaku(self, danmaku: dict) -> None:
     #     """Add a danmaku to the pool.
@@ -152,16 +161,77 @@ class DanmakuPool:
         except:
             print("Error: load_danmaku failed, file =", file_path, file=sys.stderr)
 
-    def blacklist_filter(self, blacklist: dict[str, list]) -> None:
-        """Filter danmaku by blacklist.
+    def show_common_danmaku(self, top_num: int = 50) -> None:
+        """Show the most frequent danmaku in the pool.
 
         Parameters:
 
-            blacklist: Dictionary of blacklists. The key is the room id, and the value is a list of banned danmaku.
-            Example: {"123456": ["banned danmaku 1", "banned danmaku 2"], "654321": ["banned danmaku 3"]}
+            top_num: Number of danmaku to show. Default is 50.
         """
-        for roomid in blacklist:
-            self.df = self.df[~self.df["roomid"].eq(roomid) | ~self.df["text"].isin(blacklist[roomid])]
+        for roomid in self.df["roomid"].unique():
+            print(f"Room ID: {roomid}")
+            df = self.df[self.df["roomid"].eq(roomid)]
+            counter = Counter(df["text"])
+            for text, count in counter.most_common(top_num):
+                print(f"{count:>6} {text}")
+
+    def get_danmaku_density_flat(self, roomid: str, smoothing_window: int = 0) -> tuple(np.ndarray, np.ndarray):
+        """`deprecated`
+            Get danmaku density for a room using a flat kernel.
+
+        Parameters:
+
+            roomid: Room ID.
+
+            smoothing_window: The size of the smoothing window in seconds. Default is 0, which means no smoothing
+            (kernel size = 1 second).
+
+        Returns:
+
+            A tuple of numpy array. The first array is the timestamp. The second array is the danmaku density, with
+            each element representing the number of danmaku in the corresponding second.
+        """
+        df = self.df[self.df["roomid"].eq(roomid)]
+        start_time = df["time"].min()
+        end_time = df["time"].max()
+        duration = math.ceil(end_time - start_time)
+        time = start_time + np.arange(duration)
+        density = np.zeros(duration)
+        for _time in df["time"]:
+            density[int(_time - start_time)] += 1
+        if smoothing_window > 0:
+            density = np.convolve(density, np.ones(smoothing_window), "same") / smoothing_window
+        return time, density
+
+    def get_danmaku_density_gaussian(self, roomid: str, kernel_sigma: float) -> tuple(np.ndarray, np.ndarray):
+        """Get danmaku density for a room using Gaussian kernel.
+
+        Parameters:
+
+            roomid: Room ID.
+
+            kernel_sigma: Sigma of the Gaussian kernel that's used to smooth the density. In seconds.
+
+        Returns:
+
+            A tuple of numpy array. The first array is the timestamp. The second array is the danmaku density, with
+            each element representing the number of danmaku in the corresponding second.
+        """
+        df = self.df[self.df["roomid"].eq(roomid)]
+        start_time = df["time"].min()
+        end_time = df["time"].max()
+        duration = math.ceil(end_time - start_time)
+        time = start_time + np.arange(duration)
+        density = np.zeros(duration)
+        for _time in df["time"]:
+            left = max(int(_time - start_time - 3 * kernel_sigma), 0)
+            right = min(int(_time - start_time + 3 * kernel_sigma), duration)
+            density[left:right] += (
+                1
+                / (kernel_sigma * math.sqrt(2 * math.pi))
+                * np.exp(-0.5 * ((time[left:right] - _time) / kernel_sigma) ** 2)
+            )
+        return time, density
 
 
 def parse_Bilirec_time(time_str: str) -> datetime.datetime:
@@ -285,27 +355,166 @@ def get_duration_inconsistency(video_path: str) -> tuple[float, float]:
     )
 
 
-def examine_danmaku(pool: DanmakuPool, top_num: int = 50) -> None:
-    """Show the most frequent danmaku in the pool.
+def blacklist_filter(pool: DanmakuPool, blacklist: dict[str, list]) -> DanmakuPool:
+    """Filter danmaku by blacklist.
 
     Parameters:
 
-        df: DataFrame containing the danmaku pool.
+        pool: DanmakuPool to be filtered.
 
-        top_num: Number of danmaku to show. Default is 50.
+        blacklist: Dictionary of blacklists. The key is the room id, and the value is a list of banned danmaku.
+        Example: {"123456": ["banned danmaku 1", "banned danmaku 2"], "654321": ["banned danmaku 3"]}
+
+    Returns:
+
+        DanmakuPool: Filtered DanmakuPool. The original DanmakuPool is not modified.
     """
-    stats = {}
-    for i in range(len(pool.df)):
-        danmaku = pool.df.iloc[i]
-        roomid = danmaku["roomid"]
-        text = danmaku["text"]
-        if roomid not in stats:
-            stats[roomid] = Counter()
-        stats[roomid].update({text: 1})
-    for roomid, counter in stats.items():
-        print(f"Room ID: {roomid}")
-        for text, count in counter.most_common(top_num):
-            print(f"{count:>6} {text}")
+    new_pool = DanmakuPool(pool.df)
+    for roomid in blacklist:
+        new_pool.df = new_pool.df[~new_pool.df["roomid"].eq(roomid) | ~new_pool.df["text"].isin(blacklist[roomid])]
+    return new_pool
+
+
+def get_clips_by_threshold(time: np.ndarray, density: np.ndarray, threshold: float) -> list[tuple[float, float]]:
+    """`deprecated`
+        Get clips by threshold.
+
+    Parameters:
+
+        time: Time array.
+
+        density: Density array.
+
+        threshold: Threshold.
+
+    Returns:
+
+        List of tuples. Each tuple is a clip. The first element is the start time of the clip, and the second element is
+        the end time of the clip.
+    """
+    clips = []
+    for t, d in zip(time, density):
+        if d > threshold:
+            start = max(0, t - TIME_BACKWARD)
+            end = min(time[-1], t + TIME_AFTERWARD)
+            if len(clips) > 0 and start <= clips[-1][1]:
+                clips[-1] = (clips[-1][0], end)
+            else:
+                clips.append((start, end))
+    return clips
+
+
+def get_hotspots(
+    time: np.ndarray,
+    density: np.ndarray,
+    kernel_sigma: float,
+    max_hotspots: int = 1000,
+    show_plot: bool = False,
+    show_progress: bool = False,
+) -> list[tuple[float, float, float]]:
+    """Detect hotspots by assuming that danmaku reactions are spread gaussian in time with respect to the climax event.
+
+    Parameters:
+
+        time: Time array.
+
+        density: Density array.
+
+        kernel_sigma: Sigma of the gaussian kernel used to smooth the density array.
+
+        max_hotspots: Max number of hotspots to be detected. Default is 1000. Detection stops when the new hotspot
+        causes the squared sum to increase.
+
+    Returns:
+
+        List of hotspots. Each hotspot is a tuple of time, amplitude and sigma (gaussian stdev).
+    """
+    MAX_SIGMA = 60
+    if max_hotspots == 0:
+        return []
+    # find the value and time of the maximum density
+    _amplitude = max(density)
+    _time = time[np.argmax(density)]
+    _sigma = kernel_sigma
+
+    # define gaussian function
+    def gaussian(x, mu, sig):
+        return np.exp(-np.power(x - mu, 2.0) / (2 * np.power(sig, 2.0)))
+
+    # define chisquare function
+    def chisquare(density):
+        # does not allow negative density
+        return sum(density[density > 0] ** 2) + sum(density[density < 0] ** 2) * 1e3
+
+    # define the objective function, trim to the neighborhood of the hotspot to speed up the optimization
+    def objective(x, idx):
+        new_density = density[idx] - x[1] * gaussian(time[idx], x[0], x[2])
+        return chisquare(new_density)
+
+    # optimize time, amplitude and sigma
+    left = max(0, _time - 5 * MAX_SIGMA)
+    right = min(time[-1], _time + 5 * MAX_SIGMA)
+    idx = (time >= left) & (time <= right)
+    res = minimize(
+        objective,
+        [_time, _amplitude, _sigma],
+        bounds=[(_time - 0.5 * _sigma, _time + 0.5 * _sigma), (_amplitude, _amplitude), (kernel_sigma, MAX_SIGMA)],
+        args=(idx,),
+        method="Nelder-Mead",
+    )
+    _time = res.x[0]
+    _amplitude = res.x[1]
+    _sigma = res.x[2]
+    # calculate the new density curve
+    new_density = density - _amplitude * gaussian(time, _time, _sigma)
+    # if adding the hotspot does not improve the fit, stop
+    if res.fun > chisquare(density[idx]):
+        return []
+    # show progress
+    if show_progress:
+        print("Residue:", chisquare(density))
+    # return hotspots
+    hotspots = [(_time, _amplitude, _sigma)]
+    hotspots += get_hotspots(time, new_density, kernel_sigma, max_hotspots - 1, show_progress=show_progress)
+    # if ended, show the figure using plotly
+    if show_plot:
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=[datetime.datetime.fromtimestamp(_).isoformat() for _ in time],
+                y=density,
+                mode="lines",
+                name="danmaku density",
+                line=dict(color="dodgerblue"),
+            )
+        )
+        for _time, _amplitude, _sigma in hotspots:
+            idx = (time >= _time - 3 * _sigma) & (time <= _time + 3 * _sigma)
+            # set the color of the hotspot to orange and hide the labels
+            fig.add_trace(
+                go.Scatter(
+                    x=[datetime.datetime.fromtimestamp(_).isoformat() for _ in time[idx]],
+                    y=gaussian(time[idx], _time, _sigma) * _amplitude,
+                    mode="lines",
+                    name="hotspot",
+                    line=dict(color="orange"),
+                    showlegend=False,
+                )
+            )
+        _density = deepcopy(density)
+        for _time, _amplitude, _sigma in hotspots:
+            _density -= gaussian(time, _time, _sigma) * _amplitude
+        fig.add_trace(
+            go.Scatter(
+                x=[datetime.datetime.fromtimestamp(_).isoformat() for _ in time],
+                y=_density,
+                mode="lines",
+                name="residue",
+                line=dict(color="tomato"),
+            )
+        )
+        fig.show()
+    return hotspots
 
 
 # load config
@@ -313,4 +522,7 @@ with open("config.json", "r") as f:
     config = json.load(f)
     TIMEZONE = pytz.timezone(config["timezone"])
     BLACKLIST = config["blacklist"]
-    AVERAGE_DURATION = config["average_duration"]
+    SMOOTHING_WINDOW = config["smoothing_window"]
+    TIME_BACKWARD = config["time_backward"]
+    TIME_AFTERWARD = config["time_afterward"]
+    KERNEL_SIGMA = config["kernel_sigma"]
