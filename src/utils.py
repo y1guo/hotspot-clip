@@ -238,6 +238,42 @@ class DanmakuPool:
             )
         return time, density
 
+    def export_xml(self, roomid: str, start_time: float, end_time: float, file_path: str) -> None:
+        """Export danmaku to an XML file.
+
+        Parameters:
+
+            roomid: Room ID.
+
+            start_time: Start time of the danmaku. Timestamp.
+
+            end_time: End time of the danmaku. Timestamp.
+
+            file_path: Path to the XML file.
+        """
+        df = self.df[self.df["roomid"].eq(roomid)]
+        df = df[df["time"].between(start_time, end_time)]
+        root = ET.Element("i")
+        for _, row in df.iterrows():
+            d = ET.SubElement(root, "d")
+            d.text = row["text"]
+            mode = "1"
+            if row["price"] > 0:
+                mode = "4"
+                d.text = f"【SC¥{row['price']}】" + row["uname"] + ":" + d.text
+            d.set(
+                "p",
+                "{:.3f},{},25,{},{},0,{},0".format(
+                    row["time"] - start_time,
+                    mode,
+                    row["color"],
+                    int(row["time"] * 1000),
+                    row["uid"],
+                ),
+            )
+        tree = ET.ElementTree(root)
+        tree.write(file_path, encoding="utf-8", xml_declaration=True, pretty_print=True)
+
 
 class VideoPool:
     def __init__(self) -> None:
@@ -288,7 +324,9 @@ class VideoPool:
         except:
             print("Error: add_video failed, file =", video_path, file=sys.stderr)
 
-    def generate_clips(self, roomid: str, clips: pd.DataFrame, out_dir: str, num_threads: int = 1) -> None:
+    def generate_clips(
+        self, roomid: str, clips: pd.DataFrame, out_dir: str, num_threads: int = 1, danmaku_pool: DanmakuPool = None
+    ) -> None:
         """Generate clips from the videos in the pool according to the clips information.
 
         Parameters:
@@ -300,6 +338,9 @@ class VideoPool:
             out_dir: Output directory.
 
             num_threads: Number of threads to use. Default is 1.
+
+            danmaku_pool: A DanmakuPool object. If not None, xml files will be added along with the clips.
+            Default is None.
 
         Note: This function uses multiprocessing to generate clips.
         """
@@ -335,6 +376,10 @@ class VideoPool:
                     )
                     out_path = os.path.join(out_dir, out_file)
                     args.append((video_path, ss, t, out_path))
+                    # output danmaku xml file
+                    if danmaku_pool is not None:
+                        print(f"Generating danmaku xml file: {out_path[:-4] + '.xml'}")
+                        danmaku_pool.export_xml(roomid, actual_start, actual_end, out_path[:-4] + ".xml")
         with mp.Pool(num_threads) as pool:
             pool.starmap(self._generate_clip_mp, args)
 
