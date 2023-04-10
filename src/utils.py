@@ -6,6 +6,7 @@ import pytz
 import ffmpeg
 import json
 import math
+import multiprocessing as mp
 import lxml.etree as ET
 import pandas as pd
 import numpy as np
@@ -219,6 +220,9 @@ class DanmakuPool:
             each element representing the number of danmaku in the corresponding second.
         """
         df = self.df[self.df["roomid"].eq(roomid)]
+        if df.empty:
+            print(f"Warning: get_danmaku_density_gaussian: no danmaku found, roomid = {roomid}", file=sys.stderr)
+            return np.array([]), np.array([])
         start_time = df["time"].min()
         end_time = df["time"].max()
         duration = math.ceil(end_time - start_time)
@@ -233,6 +237,126 @@ class DanmakuPool:
                 * np.exp(-0.5 * ((time[left:right] - _time) / kernel_sigma) ** 2)
             )
         return time, density
+
+
+class VideoPool:
+    def __init__(self) -> None:
+        self.df = pd.DataFrame(
+            columns=[
+                "path",
+                "roomid",
+                "creation_time",
+                "duration",
+            ]
+        )
+
+    def add_video(self, video_path: str) -> None:
+        """Add a video to the pool.
+
+        Parameters:
+
+            video_path: Path to the video.
+        """
+        try:
+            output = ffmpeg.probe(video_path)
+            tags = output["format"]["tags"]
+            if "comment" in tags:
+                comment: str = tags["comment"]
+            else:
+                comment: str = tags["Comment"]
+            for line in comment.splitlines():
+                if line.startswith("录制时间"):
+                    time_str = line.split(" ")[1]
+                    creation_time = parse_Bilirec_time(time_str)
+                elif line.startswith("B站直播间"):
+                    roomid = line.split(" ")[1]
+            duration = float(output["format"]["duration"])
+            self.df = pd.concat(
+                [
+                    self.df,
+                    pd.DataFrame(
+                        {
+                            "path": [video_path],
+                            "roomid": [roomid],
+                            "creation_time": [creation_time],
+                            "duration": [duration],
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
+        except:
+            print("Error: add_video failed, file =", video_path, file=sys.stderr)
+
+    def generate_clips(self, roomid: str, clips: pd.DataFrame, out_dir: str, num_threads: int = 1) -> None:
+        """Generate clips from the videos in the pool according to the clips information.
+
+        Parameters:
+
+            roomid: Room ID.
+
+            clips: A pandas DataFrame containing the clips information. The columns should be "start", "end".
+
+            out_dir: Output directory.
+
+            num_threads: Number of threads to use. Default is 1.
+
+        Note: This function uses multiprocessing to generate clips.
+        """
+        # if out_dir does not exist or  is not a directory, stop
+        if not os.path.exists(out_dir) or not os.path.isdir(out_dir):
+            print(f"Error: generate_clips: out_dir does not exist, out_dir = {out_dir}", file=sys.stderr)
+            return
+        # find videos
+        df = self.df[self.df["roomid"].eq(roomid)]
+        if df.empty:
+            print(f"Warning: generate_clips: no video found, roomid = {roomid}", file=sys.stderr)
+            return
+        # generate clips
+        args = []
+        for _, row in clips.iterrows():
+            start = row["start"]
+            end = row["end"]
+            for _, video_row in df.iterrows():
+                video_path = video_row["path"]
+                video_start = video_row["creation_time"].timestamp()
+                video_end = video_start + video_row["duration"]
+                if start < video_end and end > video_start:
+                    actual_start = max(start, video_start)
+                    actual_end = min(end, video_end)
+                    ss = actual_start - video_start
+                    t = actual_end - actual_start
+                    out_file = "{}_{}_{:02d}{:02d}{:02d}.mp4".format(
+                        roomid,
+                        video_row["creation_time"].strftime("%Y%m%d_%H%M%S"),
+                        int(ss) // 3600,
+                        (int(ss) % 3600) // 60,
+                        int(ss) % 60,
+                    )
+                    out_path = os.path.join(out_dir, out_file)
+                    args.append((video_path, ss, t, out_path))
+        with mp.Pool(num_threads) as pool:
+            pool.starmap(self._generate_clip_mp, args)
+
+    def _generate_clip_mp(self, video_path: str, ss: float, t: float, out_path: str) -> None:
+        """Generate a clip using ffmpeg.
+
+        Parameters:
+
+            video_path: Path to the video.
+
+            ss: Start time in seconds.
+
+            t: Duration in seconds.
+
+            out_path: Output path.
+        """
+        print(f"Generating clip: {out_path}")
+        # generate the clip without re-encoding, overwrite
+        ffmpeg.input(video_path, ss=ss, t=t).output(out_path, vcodec="copy", acodec="copy").run_async(
+            overwrite_output=True,
+            quiet=True,
+        )
 
 
 def parse_Bilirec_time(time_str: str) -> datetime.datetime:
@@ -453,7 +577,7 @@ def get_hotspots(
         return chisquare(new_density)
 
     # optimize time, amplitude and sigma
-    left = max(0, _time - 5 * MAX_SIGMA)
+    left = max(time[0], _time - 5 * MAX_SIGMA)
     right = min(time[-1], _time + 5 * MAX_SIGMA)
     idx = (time >= left) & (time <= right)
     res = minimize(
@@ -567,41 +691,57 @@ def get_hotspots(
     return hotspots
 
 
-def get_clips(hotspots: pd.DataFrame, num_clips: int) -> pd.DataFrame:
+def get_clips(hotspots: pd.DataFrame, percentile: float = 0, threshold: float = 0, num: int = 0) -> pd.DataFrame:
     """Get the start and end time of the clips.
 
     Parameters:
 
         hotspots: DataFrame of hotspots.
 
-        num_clips: number of clips to return
+        percentile: the percentile of the amplitudes of the hotspots to return. 0 <= percentile <= 1. If 0, return all
+        clips. If non-zero, return the clips with the amplitudes higher than the percentile. Default is 0.
+
+        threshold: the threshold of the amplitudes of the hotspots to return. If 0, return all clips. If non-zero,
+        return the clips with the amplitudes higher than the threshold. Default is 0.
+
+        num: number of clips to return. If 0, return all clips. If non-zero, return the top-N clips with the
+        highest amplitudes. Default is 0. Note that the number of returned clips might be smaller if clips merge.
 
     Returns:
 
         A DataFrame with columns "start", "end".
     """
-    # sort the hotspots by time
+    # select the hotspots with the amplitudes higher than the percentile
+    if percentile > 0:
+        hotspots = hotspots[hotspots["amplitude"] >= hotspots["amplitude"].quantile(percentile)]
+    # select the hotspots with the amplitudes higher than the threshold
+    if threshold > 0:
+        hotspots = hotspots[hotspots["amplitude"] >= threshold]
+    # select the top-N hotspots with the highest amplitudes
+    if num > 0 and num < hotspots.shape[0]:
+        hotspots = hotspots.sort_values(by="amplitude", ascending=False).iloc[:num]
+    # sort the hotspots by the time
     hotspots = hotspots.sort_values(by="time")
-    # get the time of the first and last hotspots
-    start = hotspots["time"].iloc[0]
-    end = hotspots["time"].iloc[-1]
-    # get the time of the hotspots in the middle
-    middle = hotspots["time"].iloc[1:-1]
-    # get the time of the hotspots in the middle
+    # get the start and end time of the clips
     clips = pd.DataFrame(columns=["start", "end"])
-    # if there are no hotspots in the middle, return the first and last hotspots
-    if len(middle) == 0:
-        clips = clips.append({"start": start, "end": end}, ignore_index=True)
-        return clips
-    # if there are hotspots in the middle, get the time of the hotspots in the middle
-    # and return the first and last hotspots and the hotspots in the middle
-    clips = clips.append({"start": start, "end": middle.iloc[0]}, ignore_index=True)
-    for i in range(len(middle) - 1):
-        clips = clips.append({"start": middle.iloc[i], "end": middle.iloc[i + 1]}, ignore_index=True)
-    clips = clips.append({"start": middle.iloc[-1], "end": end}, ignore_index=True)
-    # if there are more clips than required, randomly select some of them
-    if len(clips) > num_clips:
-        clips = clips.sample(n=num_clips, random_state=42)
+    for _, row in hotspots.iterrows():
+        start = row["time"] - 2 * row["sigma"] - TIME_BACKWARD
+        end = row["time"] + 2 * row["sigma"] + TIME_AFTERWARD
+        if clips.empty:
+            clips = pd.DataFrame([[start, end]], columns=["start", "end"])
+        else:
+            if start <= clips.iloc[-1]["end"]:
+                clips.iloc[-1]["end"] = end
+            else:
+                clips = pd.concat([clips, pd.DataFrame([[start, end]], columns=["start", "end"])], ignore_index=True)
+    # sammary message
+    print(
+        "Total {} clips. Duration: {}. Lowest amplitude: {:.2f}.".format(
+            clips.shape[0],
+            datetime.timedelta(seconds=clips["end"].sum() - clips["start"].sum()),
+            hotspots["amplitude"].min(),
+        ),
+    )
     return clips
 
 
