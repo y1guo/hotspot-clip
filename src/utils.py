@@ -17,6 +17,20 @@ from copy import deepcopy
 from scipy.optimize import minimize
 
 
+class Keyword:
+    def __init__(self, exact: list[str] = [], fuzzy: list[str] = []) -> None:
+        self.exact = exact
+        self.fuzzy = fuzzy
+
+    def match(self, text: str) -> bool:
+        if text in self.exact:
+            return True
+        for word in self.fuzzy:
+            if word in text:
+                return True
+        return False
+
+
 class DanmakuPool:
     def __init__(self, df: pd.DataFrame = None) -> None:
         # initialize empty data frame
@@ -149,21 +163,21 @@ class DanmakuPool:
                 danmaku["uname"].append(child.attrib["user"])
                 danmaku["color"].append(int(p[3]))
                 danmaku["price"].append(0)
-                danmaku["text"].append(child.text)
+                danmaku["text"].append(child.text if child.text else "")
             for child in root.findall("sc"):
-                danmaku["time"].append(start_time + float(p[0]))
+                danmaku["time"].append(start_time + float(child.attrib["ts"]))
                 danmaku["offset"].append(0)
                 danmaku["roomid"].append(roomid)
                 danmaku["uid"].append(child.attrib["uid"])
                 danmaku["uname"].append(child.attrib["user"])
                 danmaku["color"].append(16772431)
                 danmaku["price"].append(int(child.attrib["price"]))
-                danmaku["text"].append(child.text)
+                danmaku["text"].append(child.text if child.text else "")
             self.df = pd.concat([self.df, pd.DataFrame(danmaku)], ignore_index=True)
         except:
             print("Error: load_danmaku failed, file =", file_path, file=sys.stderr)
 
-    def show_common_danmaku(self, top_num: int = 50) -> None:
+    def show_common_danmaku(self, num: int = 50) -> None:
         """Show the most frequent danmaku in the pool.
 
         Parameters:
@@ -174,36 +188,56 @@ class DanmakuPool:
             print(f"Room ID: {roomid}")
             df = self.df[self.df["roomid"].eq(roomid)]
             counter = Counter(df["text"])
-            for text, count in counter.most_common(top_num):
+            for text, count in counter.most_common(num):
                 print(f"{count:>6} {text}")
 
-    def get_danmaku_density_flat(self, roomid: str, smoothing_window: int = 0) -> tuple(np.ndarray, np.ndarray):
-        """`deprecated`
-            Get danmaku density for a room using a flat kernel.
+    def whitelist_filter(self, keywords: list[Keyword] = None, roomid: str = None) -> DanmakuPool:
+        """Filter danmaku using a whitelist.
 
         Parameters:
 
-            roomid: Room ID.
+            keywords: A list of Keywords. If None, all danmaku are included. Default is None.
 
-            smoothing_window: The size of the smoothing window in seconds. Default is 0, which means no smoothing
-            (kernel size = 1 second).
+            roomid: Room ID. If None, all rooms are included. Default is None.
 
         Returns:
 
-            A tuple of numpy array. The first array is the timestamp. The second array is the danmaku density, with
-            each element representing the number of danmaku in the corresponding second.
+            A new DanmakuPool object. The original DanmakuPool object is not modified.
         """
-        df = self.df[self.df["roomid"].eq(roomid)]
-        start_time = df["time"].min()
-        end_time = df["time"].max()
-        duration = math.ceil(end_time - start_time)
-        time = start_time + np.arange(duration)
-        density = np.zeros(duration)
-        for _time in df["time"]:
-            density[int(_time - start_time)] += 1
-        if smoothing_window > 0:
-            density = np.convolve(density, np.ones(smoothing_window), "same") / smoothing_window
-        return time, density
+        df = deepcopy(self.df)
+        if roomid is not None:
+            df = df[df["roomid"].eq(roomid)]
+        if keywords is not None:
+            df = df[df["text"].apply(lambda x: any([keyword.match(x) for keyword in keywords]))]
+        return DanmakuPool(df)
+
+    # def get_danmaku_density_flat(self, roomid: str, smoothing_window: int = 0) -> tuple(np.ndarray, np.ndarray):
+    #     """`deprecated`
+    #         Get danmaku density for a room using a flat kernel.
+
+    #     Parameters:
+
+    #         roomid: Room ID.
+
+    #         smoothing_window: The size of the smoothing window in seconds. Default is 0, which means no smoothing
+    #         (kernel size = 1 second).
+
+    #     Returns:
+
+    #         A tuple of numpy array. The first array is the timestamp. The second array is the danmaku density, with
+    #         each element representing the number of danmaku in the corresponding second.
+    #     """
+    #     df = self.df[self.df["roomid"].eq(roomid)]
+    #     start_time = df["time"].min()
+    #     end_time = df["time"].max()
+    #     duration = math.ceil(end_time - start_time)
+    #     time = start_time + np.arange(duration)
+    #     density = np.zeros(duration)
+    #     for _time in df["time"]:
+    #         density[int(_time - start_time)] += 1
+    #     if smoothing_window > 0:
+    #         density = np.convolve(density, np.ones(smoothing_window), "same") / smoothing_window
+    #     return time, density
 
     def get_danmaku_density_gaussian(self, roomid: str, kernel_sigma: float) -> tuple(np.ndarray, np.ndarray):
         """Get danmaku density for a room using Gaussian kernel.
@@ -259,7 +293,7 @@ class DanmakuPool:
             d.text = row["text"]
             mode = "1"
             if row["price"] > 0:
-                mode = "4"
+                mode = "3"
                 d.text = f"【SC¥{row['price']}】" + row["uname"] + ":" + d.text
             d.set(
                 "p",
@@ -307,6 +341,16 @@ class VideoPool:
                 elif line.startswith("B站直播间"):
                     roomid = line.split(" ")[1]
             duration = float(output["format"]["duration"])
+            # try to correct creation time for videos that were split afterwards
+            try:
+                time_str = video_path.split(roomid + "_")[1][:15]
+                creation_time_from_filename = datetime.datetime.strptime(time_str, "%Y%m%d_%H%M%S")
+                creation_time_from_filename = TIMEZONE.localize(creation_time_from_filename)
+                if abs((creation_time_from_filename - creation_time).total_seconds()) > 1:
+                    creation_time = creation_time_from_filename
+                    print("Warning: add_video: corrected creation time, file =", video_path, file=sys.stderr)
+            except:
+                pass
             self.df = pd.concat(
                 [
                     self.df,
@@ -325,7 +369,7 @@ class VideoPool:
             print("Error: add_video failed, file =", video_path, file=sys.stderr)
 
     def generate_clips(
-        self, roomid: str, clips: pd.DataFrame, out_dir: str, num_threads: int = 1, danmaku_pool: DanmakuPool = None
+        self, roomid: str, clips: pd.DataFrame, out_dir: str, danmaku_pool: DanmakuPool = None, num_threads: int = 1
     ) -> None:
         """Generate clips from the videos in the pool according to the clips information.
 
@@ -333,14 +377,15 @@ class VideoPool:
 
             roomid: Room ID.
 
-            clips: A pandas DataFrame containing the clips information. The columns should be "start", "end".
+            clips: A pandas DataFrame containing the clips information. The columns should be "start", "end",
+            "amplitude".
 
             out_dir: Output directory.
 
-            num_threads: Number of threads to use. Default is 1.
-
             danmaku_pool: A DanmakuPool object. If not None, xml files will be added along with the clips.
             Default is None.
+
+            num_threads: Number of threads to use. Default is 1.
 
         Note: This function uses multiprocessing to generate clips.
         """
@@ -355,6 +400,7 @@ class VideoPool:
             return
         # generate clips
         args = []
+        summary = pd.DataFrame(columns=["file", "amplitude"])
         for _, row in clips.iterrows():
             start = row["start"]
             end = row["end"]
@@ -378,10 +424,26 @@ class VideoPool:
                     args.append((video_path, ss, t, out_path))
                     # output danmaku xml file
                     if danmaku_pool is not None:
-                        print(f"Generating danmaku xml file: {out_path[:-4] + '.xml'}")
+                        print(f"Generating danmaku xml file: {out_path[:-4] + '.xml'}", flush=True)
                         danmaku_pool.export_xml(roomid, actual_start, actual_end, out_path[:-4] + ".xml")
+                    # update summary
+                    summary = pd.concat(
+                        [
+                            summary,
+                            pd.DataFrame(
+                                {
+                                    "file": [out_file],
+                                    "amplitude": [row["amplitude"]],
+                                }
+                            ),
+                        ],
+                        ignore_index=True,
+                    )
         with mp.Pool(num_threads) as pool:
             pool.starmap(self._generate_clip_mp, args)
+        # output summary
+        summary = summary.sort_values(by="amplitude", ascending=False).reset_index(drop=True)
+        summary.to_csv(os.path.join(out_dir, f"{roomid}_summary.csv"), index=False)
 
     def _generate_clip_mp(self, video_path: str, ss: float, t: float, out_path: str) -> None:
         """Generate a clip using ffmpeg.
@@ -396,7 +458,7 @@ class VideoPool:
 
             out_path: Output path.
         """
-        print(f"Generating clip: {out_path}")
+        print(f"Generating clip: {out_path}", flush=True)
         # generate the clip without re-encoding, overwrite
         ffmpeg.input(video_path, ss=ss, t=t).output(out_path, vcodec="copy", acodec="copy").run_async(
             overwrite_output=True,
@@ -545,40 +607,40 @@ def blacklist_filter(pool: DanmakuPool, blacklist: dict[str, list]) -> DanmakuPo
     return new_pool
 
 
-def get_clips_by_threshold(time: np.ndarray, density: np.ndarray, threshold: float) -> list[tuple[float, float]]:
-    """`deprecated`
-        Get clips by threshold.
+# def get_clips_by_threshold(time: np.ndarray, density: np.ndarray, threshold: float) -> list[tuple[float, float]]:
+#     """`deprecated`
+#         Get clips by threshold.
 
-    Parameters:
+#     Parameters:
 
-        time: Time array.
+#         time: Time array.
 
-        density: Density array.
+#         density: Density array.
 
-        threshold: Threshold.
+#         threshold: Threshold.
 
-    Returns:
+#     Returns:
 
-        List of tuples. Each tuple is a clip. The first element is the start time of the clip, and the second element is
-        the end time of the clip.
-    """
-    clips = []
-    for t, d in zip(time, density):
-        if d > threshold:
-            start = max(0, t - TIME_BACKWARD)
-            end = min(time[-1], t + TIME_AFTERWARD)
-            if len(clips) > 0 and start <= clips[-1][1]:
-                clips[-1] = (clips[-1][0], end)
-            else:
-                clips.append((start, end))
-    return clips
+#         List of tuples. Each tuple is a clip. The first element is the start time of the clip, and the second element is
+#         the end time of the clip.
+#     """
+#     clips = []
+#     for t, d in zip(time, density):
+#         if d > threshold:
+#             start = max(0, t - TIME_BACKWARD)
+#             end = min(time[-1], t + TIME_AFTERWARD)
+#             if len(clips) > 0 and start <= clips[-1][1]:
+#                 clips[-1] = (clips[-1][0], end)
+#             else:
+#                 clips.append((start, end))
+#     return clips
 
 
 def get_hotspots(
     time: np.ndarray,
     density: np.ndarray,
     kernel_sigma: float,
-    max_hotspots: int = 1000,
+    max_hotspots: int = 10000,
     show_plot: bool = False,
     show_progress: bool = False,
 ) -> pd.DataFrame:
@@ -754,7 +816,7 @@ def get_clips(hotspots: pd.DataFrame, percentile: float = 0, threshold: float = 
 
     Returns:
 
-        A DataFrame with columns "start", "end".
+        A DataFrame with columns "start", "end", "amplitude".
     """
     # select the hotspots with the amplitudes higher than the percentile
     if percentile > 0:
@@ -768,17 +830,22 @@ def get_clips(hotspots: pd.DataFrame, percentile: float = 0, threshold: float = 
     # sort the hotspots by the time
     hotspots = hotspots.sort_values(by="time")
     # get the start and end time of the clips
-    clips = pd.DataFrame(columns=["start", "end"])
+    clips = pd.DataFrame(columns=["start", "end", "amplitude"])
     for _, row in hotspots.iterrows():
         start = row["time"] - 2 * row["sigma"] - TIME_BACKWARD
         end = row["time"] + 2 * row["sigma"] + TIME_AFTERWARD
+        amplitude = row["amplitude"]
         if clips.empty:
-            clips = pd.DataFrame([[start, end]], columns=["start", "end"])
+            clips = pd.DataFrame([[start, end, amplitude]], columns=["start", "end", "amplitude"])
         else:
             if start <= clips.iloc[-1]["end"]:
                 clips.iloc[-1]["end"] = end
+                clips.iloc[-1]["amplitude"] = max(clips.iloc[-1]["amplitude"], amplitude)
             else:
-                clips = pd.concat([clips, pd.DataFrame([[start, end]], columns=["start", "end"])], ignore_index=True)
+                clips = pd.concat(
+                    [clips, pd.DataFrame([[start, end, amplitude]], columns=["start", "end", "amplitude"])],
+                    ignore_index=True,
+                )
     # sammary message
     print(
         "Total {} clips. Duration: {}. Lowest amplitude: {:.2f}.".format(
@@ -799,3 +866,4 @@ with open("config.json", "r") as f:
     TIME_BACKWARD = config["time_backward"]
     TIME_AFTERWARD = config["time_afterward"]
     KERNEL_SIGMA = config["kernel_sigma"]
+    KEYWORDS = config["keywords"]
