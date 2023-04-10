@@ -10,6 +10,7 @@ import lxml.etree as ET
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from collections import Counter
 from copy import deepcopy
 from scipy.optimize import minimize
@@ -64,8 +65,8 @@ class DanmakuPool:
     def add_danmaku_from_xml(self, file_path: str) -> None:
         """Add danmaku to the pool from xml file.
 
-        The xml file is expected to have a <BililiveRecorderRecordInfo> tag with metadata, a <d> tag for each danmaku and
-        a <sc> tag for each superchat.
+        The xml file is expected to have a <BililiveRecorderRecordInfo> tag with metadata, a <d> tag for each danmaku
+        and a <sc> tag for each superchat.
 
         The <BiliLiveRecorderRecordInfo> tag is expected to have the following attributes:
 
@@ -411,7 +412,7 @@ def get_hotspots(
     max_hotspots: int = 1000,
     show_plot: bool = False,
     show_progress: bool = False,
-) -> list[tuple[float, float, float]]:
+) -> pd.DataFrame:
     """Detect hotspots by assuming that danmaku reactions are spread gaussian in time with respect to the climax event.
 
     Parameters:
@@ -427,11 +428,11 @@ def get_hotspots(
 
     Returns:
 
-        List of hotspots. Each hotspot is a tuple of time, amplitude and sigma (gaussian stdev).
+        A DataFrame with columns "time", "amplitude", "sigma".
     """
     MAX_SIGMA = 60
     if max_hotspots == 0:
-        return []
+        return pd.DataFrame(columns=["time", "amplitude", "sigma"])
     # find the value and time of the maximum density
     _amplitude = max(density)
     _time = time[np.argmax(density)]
@@ -469,16 +470,20 @@ def get_hotspots(
     new_density = density - _amplitude * gaussian(time, _time, _sigma)
     # if adding the hotspot does not improve the fit, stop
     if res.fun > chisquare(density[idx]):
-        return []
+        return pd.DataFrame(columns=["time", "amplitude", "sigma"])
     # show progress
     if show_progress:
         print("Residue:", chisquare(density))
     # return hotspots
-    hotspots = [(_time, _amplitude, _sigma)]
-    hotspots += get_hotspots(time, new_density, kernel_sigma, max_hotspots - 1, show_progress=show_progress)
+    hotspots = pd.DataFrame([[_time, _amplitude, _sigma]], columns=["time", "amplitude", "sigma"])
+    hotspots = pd.concat(
+        [hotspots, get_hotspots(time, new_density, kernel_sigma, max_hotspots - 1, show_progress=show_progress)],
+        ignore_index=True,
+    )
     # if ended, show the figure using plotly
     if show_plot:
-        fig = go.Figure()
+        # create a figure with two subplots, let the right one 1/4 of the width of the left one
+        fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[9, 1], horizontal_spacing=0)
         fig.add_trace(
             go.Scatter(
                 x=[datetime.datetime.fromtimestamp(_).isoformat() for _ in time],
@@ -486,24 +491,29 @@ def get_hotspots(
                 mode="lines",
                 name="danmaku density",
                 line=dict(color="dodgerblue"),
-            )
+            ),
+            row=1,
+            col=1,
         )
-        for _time, _amplitude, _sigma in hotspots:
-            idx = (time >= _time - 3 * _sigma) & (time <= _time + 3 * _sigma)
+        for _, row in hotspots.iterrows():
+            idx = (time >= row["time"] - 3 * row["sigma"]) & (time <= row["time"] + 3 * row["sigma"])
             # set the color of the hotspot to orange and hide the labels
             fig.add_trace(
                 go.Scatter(
                     x=[datetime.datetime.fromtimestamp(_).isoformat() for _ in time[idx]],
-                    y=gaussian(time[idx], _time, _sigma) * _amplitude,
+                    y=gaussian(time[idx], row["time"], row["sigma"]) * row["amplitude"],
                     mode="lines",
                     name="hotspot",
                     line=dict(color="orange"),
                     showlegend=False,
-                )
+                ),
+                row=1,
+                col=1,
             )
+
         _density = deepcopy(density)
-        for _time, _amplitude, _sigma in hotspots:
-            _density -= gaussian(time, _time, _sigma) * _amplitude
+        for _, row in hotspots.iterrows():
+            _density -= gaussian(time, row["time"], row["sigma"]) * row["amplitude"]
         fig.add_trace(
             go.Scatter(
                 x=[datetime.datetime.fromtimestamp(_).isoformat() for _ in time],
@@ -511,10 +521,88 @@ def get_hotspots(
                 mode="lines",
                 name="residue",
                 line=dict(color="tomato"),
-            )
+            ),
+            row=1,
+            col=1,
         )
+        # show the amplitudes of the hotspots as a histogram, y-axis is the amplitude, x-axis is the number of hotspots
+        fig.add_trace(
+            go.Histogram(
+                y=hotspots["amplitude"],
+                name="amplitude",
+                marker_color="dodgerblue",
+                orientation="h",
+                showlegend=False,
+            ),
+            row=1,
+            col=2,
+        )
+        # add vertical lines at the median, 3/4 quantiles, with different colors
+        fig.add_shape(
+            type="line",
+            x0=0,
+            y0=hotspots["amplitude"].median(),
+            x1=hotspots.shape[0],
+            y1=hotspots["amplitude"].median(),
+            line=dict(color="tomato", dash="dash"),
+            row=1,
+            col=2,
+        )
+        fig.add_shape(
+            type="line",
+            x0=0,
+            y0=hotspots["amplitude"].quantile(0.75),
+            x1=hotspots.shape[0],
+            y1=hotspots["amplitude"].quantile(0.75),
+            line=dict(color="tomato", dash="dash"),
+            row=1,
+            col=2,
+        )
+        # move the legend on top of the figure, in the center, show in horizontal direction
+        fig.update_layout(legend=dict(xanchor="center", yanchor="bottom", x=0.5, y=1, orientation="h"))
+        # reduce the margin of the figure
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+        # show the figure
         fig.show()
     return hotspots
+
+
+def get_clips(hotspots: pd.DataFrame, num_clips: int) -> pd.DataFrame:
+    """Get the start and end time of the clips.
+
+    Parameters:
+
+        hotspots: DataFrame of hotspots.
+
+        num_clips: number of clips to return
+
+    Returns:
+
+        A DataFrame with columns "start", "end".
+    """
+    # sort the hotspots by time
+    hotspots = hotspots.sort_values(by="time")
+    # get the time of the first and last hotspots
+    start = hotspots["time"].iloc[0]
+    end = hotspots["time"].iloc[-1]
+    # get the time of the hotspots in the middle
+    middle = hotspots["time"].iloc[1:-1]
+    # get the time of the hotspots in the middle
+    clips = pd.DataFrame(columns=["start", "end"])
+    # if there are no hotspots in the middle, return the first and last hotspots
+    if len(middle) == 0:
+        clips = clips.append({"start": start, "end": end}, ignore_index=True)
+        return clips
+    # if there are hotspots in the middle, get the time of the hotspots in the middle
+    # and return the first and last hotspots and the hotspots in the middle
+    clips = clips.append({"start": start, "end": middle.iloc[0]}, ignore_index=True)
+    for i in range(len(middle) - 1):
+        clips = clips.append({"start": middle.iloc[i], "end": middle.iloc[i + 1]}, ignore_index=True)
+    clips = clips.append({"start": middle.iloc[-1], "end": end}, ignore_index=True)
+    # if there are more clips than required, randomly select some of them
+    if len(clips) > num_clips:
+        clips = clips.sample(n=num_clips, random_state=42)
+    return clips
 
 
 # load config

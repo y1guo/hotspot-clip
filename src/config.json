@@ -78,7 +78,7 @@
         ]
     },
     "smoothing_window": 15,
+    "kernel_sigma": 10,
     "time_backward": 50,
-    "time_afterward": 15,
-    "kernel_sigma": 10
+    "time_afterward": 15
 }
