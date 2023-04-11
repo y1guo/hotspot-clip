@@ -642,6 +642,7 @@ def get_hotspots(
     kernel_sigma: float,
     max_hotspots: int = 10000,
     show_plot: bool = False,
+    subsample: int = 16,
     show_progress: bool = False,
 ) -> pd.DataFrame:
     """Detect hotspots by assuming that danmaku reactions are spread gaussian in time with respect to the climax event.
@@ -656,6 +657,12 @@ def get_hotspots(
 
         max_hotspots: Max number of hotspots to be detected. Default is 1000. Detection stops when the new hotspot
         causes the squared sum to increase.
+
+        show_plot: Whether to show the plot. Default is False.
+
+        subsample: Subsample the density array to speed up plotting. Default is 16.
+
+        show_progress: Whether to show the progress of regression. Default is False.
 
     Returns:
 
@@ -713,6 +720,13 @@ def get_hotspots(
     )
     # if ended, show the figure using plotly
     if show_plot:
+        # subsample density to speed up plotting
+        density = density[::subsample]
+        time = time[::subsample]
+        # remove unncessary points where density is zero
+        idx = density > 0
+        time = time[idx]
+        density = density[idx]
         # create a figure with two subplots, let the right one 1/4 of the width of the left one
         fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[9, 1], horizontal_spacing=0)
         fig.add_trace(
