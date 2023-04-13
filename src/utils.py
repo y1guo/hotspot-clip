@@ -32,6 +32,31 @@ class Keyword:
 
 
 class DanmakuPool:
+    """A pool of danmaku.
+
+    Attributes:
+
+        df: A pandas DataFrame with the following columns:
+
+            time: Danmaku timestamp, timestamp, example: 1680514935.055
+
+            offset: display time offset w.r.t. the timestamp, float, example: 1.214, -2.089
+
+            roomid: room id, string, example: "92613"
+
+            uid: user id, string, example: "74354088"
+
+            uname: user name, string, example: "ymyyg"
+
+            color: color, int, example: 16777215
+
+            price: price in CNY if superchat, int, example: 0
+
+            text: danmaku text, example: "233333"
+
+            weight: weight of the danmaku, example: 1
+    """
+
     def __init__(self, df: pd.DataFrame = None) -> None:
         # initialize empty data frame
         if df is None:
@@ -45,39 +70,13 @@ class DanmakuPool:
                     "color",
                     "price",
                     "text",
+                    "weight",
                 ]
             )
         else:
             self.df = deepcopy(df)
 
-    # def add_danmaku(self, danmaku: dict) -> None:
-    #     """Add a danmaku to the pool.
-
-    #     Parameters:
-    #         danmaku: A dictionary of danmaku attributes:
-
-    #             time: Danmaku timestamp, timestamp, example: 1680514935.055
-
-    #             offset: display time offset w.r.t. the timestamp, float, example: 1.214, -2.089
-
-    #             roomid: room id, string, example: "92613"
-
-    #             uid: user id, string, example: "74354088"
-
-    #             uname: user name, string, example: "ymyyg"
-
-    #             color: color, int, example: 16777215
-
-    #             price: price in CNY if superchat, int, example: 0
-
-    #             text: danmaku text, example: "233333"
-
-    #     Returns:
-    #         None
-    #     """
-    #     self.df = pd.concat([self.df, pd.DataFrame([danmaku])], ignore_index=True)
-
-    def add_danmaku_from_xml(self, file_path: str) -> None:
+    def add_danmaku_from_xml(self, file_path: str, verbose: bool = False) -> None:
         """Add danmaku to the pool from xml file.
 
         The xml file is expected to have a <BililiveRecorderRecordInfo> tag with metadata, a <d> tag for each danmaku
@@ -142,6 +141,9 @@ class DanmakuPool:
             tree = ET.parse(file_path)
             root = tree.getroot()
             info = root.find("BililiveRecorderRecordInfo")
+            # if not Bilirec danmaku file, skip
+            if info is None:
+                return
             roomid = info.attrib["roomid"]
             start_time = parse_Bilirec_time(info.attrib["start_time"]).timestamp()
             danmaku = {
@@ -153,6 +155,7 @@ class DanmakuPool:
                 "color": [],
                 "price": [],
                 "text": [],
+                "weight": [],
             }
             for child in root.findall("d"):
                 p = child.attrib["p"].split(",")
@@ -164,6 +167,7 @@ class DanmakuPool:
                 danmaku["color"].append(int(p[3]))
                 danmaku["price"].append(0)
                 danmaku["text"].append(child.text if child.text else "")
+                danmaku["weight"].append(1)
             for child in root.findall("sc"):
                 danmaku["time"].append(start_time + float(child.attrib["ts"]))
                 danmaku["offset"].append(0)
@@ -173,7 +177,11 @@ class DanmakuPool:
                 danmaku["color"].append(16772431)
                 danmaku["price"].append(int(child.attrib["price"]))
                 danmaku["text"].append(child.text if child.text else "")
+                danmaku["weight"].append(1)
             self.df = pd.concat([self.df, pd.DataFrame(danmaku)], ignore_index=True)
+            # print message if verbose
+            if verbose:
+                print(f"Loaded danmaku from {file_path}")
         except:
             print("Error: load_danmaku failed, file =", file_path, file=sys.stderr)
 
@@ -182,7 +190,7 @@ class DanmakuPool:
 
         Parameters:
 
-            top_num: Number of danmaku to show. Default is 50.
+            num: Number of danmaku to show. Default is 50.
         """
         for roomid in self.df["roomid"].unique():
             print(f"Room ID: {roomid}")
@@ -191,12 +199,17 @@ class DanmakuPool:
             for text, count in counter.most_common(num):
                 print(f"{count:>6} {text}")
 
-    def whitelist_filter(self, keywords: list[Keyword] = None, roomid: str = None) -> DanmakuPool:
-        """Filter danmaku using a whitelist.
+    def filter(
+        self, whitelist: list[Keyword] = None, blacklist: list[Keyword] = None, roomid: str = None
+    ) -> DanmakuPool:
+        """Filter danmaku in the pool.
 
         Parameters:
 
-            keywords: A list of Keywords. If None, all danmaku are included. Default is None.
+            whitelist: A list of allowed Keywords. If None, no danmaku will be filtered by the whitelist.
+            Default is None.
+
+            blacklist: A list of forbidden Keywords. If None, no danmaku will be filtered by the blacklist.
 
             roomid: Room ID. If None, all rooms are included. Default is None.
 
@@ -207,39 +220,34 @@ class DanmakuPool:
         df = deepcopy(self.df)
         if roomid is not None:
             df = df[df["roomid"].eq(roomid)]
-        if keywords is not None:
-            df = df[df["text"].apply(lambda x: any([keyword.match(x) for keyword in keywords]))]
+        if whitelist is not None:
+            df = df[df["text"].apply(lambda x: any([keyword.match(x) for keyword in whitelist]))]
+        if blacklist is not None:
+            df = df[df["text"].apply(lambda x: not any([keyword.match(x) for keyword in blacklist]))]
         return DanmakuPool(df)
 
-    # def get_danmaku_density_flat(self, roomid: str, smoothing_window: int = 0) -> tuple(np.ndarray, np.ndarray):
-    #     """`deprecated`
-    #         Get danmaku density for a room using a flat kernel.
+    def segments(self) -> list[DanmakuPool]:
+        """Split the pool into a list of DanmakuPool objects, each containing danmaku from a single room within a
+        single stream. Streams are considered to be separated by a gap of more than 1 hour.
 
-    #     Parameters:
+        Returns:
 
-    #         roomid: Room ID.
+            A list of DanmakuPool objects.
+        """
+        seg = []
+        for roomid in self.df["roomid"].unique():
+            df = self.filter(roomid=roomid).df.sort_values(by="time")
+            time = df["time"].values
+            left, right = 0, 1
+            while right < len(df):
+                if time[right] - time[right - 1] > 3600:
+                    seg.append(DanmakuPool(df.iloc[left:right]))
+                    left = right
+                right += 1
+            seg.append(DanmakuPool(df.iloc[left:right]))
+        return seg
 
-    #         smoothing_window: The size of the smoothing window in seconds. Default is 0, which means no smoothing
-    #         (kernel size = 1 second).
-
-    #     Returns:
-
-    #         A tuple of numpy array. The first array is the timestamp. The second array is the danmaku density, with
-    #         each element representing the number of danmaku in the corresponding second.
-    #     """
-    #     df = self.df[self.df["roomid"].eq(roomid)]
-    #     start_time = df["time"].min()
-    #     end_time = df["time"].max()
-    #     duration = math.ceil(end_time - start_time)
-    #     time = start_time + np.arange(duration)
-    #     density = np.zeros(duration)
-    #     for _time in df["time"]:
-    #         density[int(_time - start_time)] += 1
-    #     if smoothing_window > 0:
-    #         density = np.convolve(density, np.ones(smoothing_window), "same") / smoothing_window
-    #     return time, density
-
-    def get_danmaku_density_gaussian(self, roomid: str, kernel_sigma: float) -> tuple(np.ndarray, np.ndarray):
+    def get_danmaku_density(self, roomid: str, kernel_sigma: float) -> tuple(np.ndarray, np.ndarray):
         """Get danmaku density for a room using Gaussian kernel.
 
         Parameters:
@@ -587,65 +595,16 @@ def get_duration_inconsistency(video_path: str) -> tuple[float, float]:
     )
 
 
-def blacklist_filter(pool: DanmakuPool, blacklist: dict[str, list]) -> DanmakuPool:
-    """Filter danmaku by blacklist.
-
-    Parameters:
-
-        pool: DanmakuPool to be filtered.
-
-        blacklist: Dictionary of blacklists. The key is the room id, and the value is a list of banned danmaku.
-        Example: {"123456": ["banned danmaku 1", "banned danmaku 2"], "654321": ["banned danmaku 3"]}
-
-    Returns:
-
-        DanmakuPool: Filtered DanmakuPool. The original DanmakuPool is not modified.
-    """
-    new_pool = DanmakuPool(pool.df)
-    for roomid in blacklist:
-        new_pool.df = new_pool.df[~new_pool.df["roomid"].eq(roomid) | ~new_pool.df["text"].isin(blacklist[roomid])]
-    return new_pool
-
-
-# def get_clips_by_threshold(time: np.ndarray, density: np.ndarray, threshold: float) -> list[tuple[float, float]]:
-#     """`deprecated`
-#         Get clips by threshold.
-
-#     Parameters:
-
-#         time: Time array.
-
-#         density: Density array.
-
-#         threshold: Threshold.
-
-#     Returns:
-
-#         List of tuples. Each tuple is a clip. The first element is the start time of the clip, and the second element is
-#         the end time of the clip.
-#     """
-#     clips = []
-#     for t, d in zip(time, density):
-#         if d > threshold:
-#             start = max(0, t - TIME_BACKWARD)
-#             end = min(time[-1], t + TIME_AFTERWARD)
-#             if len(clips) > 0 and start <= clips[-1][1]:
-#                 clips[-1] = (clips[-1][0], end)
-#             else:
-#                 clips.append((start, end))
-#     return clips
-
-
 def get_hotspots(
     time: np.ndarray,
     density: np.ndarray,
     kernel_sigma: float,
-    max_hotspots: int = 10000,
+    max_hotspots: int = 1000000000,
     show_plot: bool = False,
-    subsample: int = 16,
     show_progress: bool = False,
 ) -> pd.DataFrame:
     """Detect hotspots by assuming that danmaku reactions are spread gaussian in time with respect to the climax event.
+    Fitting the density curve with amplitude * exp(- (time - time_of_climax) ** 2 / (2 * sigma ** 2)).
 
     Parameters:
 
@@ -660,8 +619,6 @@ def get_hotspots(
 
         show_plot: Whether to show the plot. Default is False.
 
-        subsample: Subsample the density array to speed up plotting. Default is 16.
-
         show_progress: Whether to show the progress of regression. Default is False.
 
     Returns:
@@ -669,6 +626,10 @@ def get_hotspots(
         A DataFrame with columns "time", "amplitude", "sigma".
     """
     MAX_SIGMA = 60
+    # show progress
+    if show_progress:
+        print("Residue:", chisquare(density))
+    # recursion stop condition
     if max_hotspots == 0:
         return pd.DataFrame(columns=["time", "amplitude", "sigma"])
     # find the value and time of the maximum density
@@ -701,17 +662,12 @@ def get_hotspots(
         args=(idx,),
         method="Nelder-Mead",
     )
-    _time = res.x[0]
-    _amplitude = res.x[1]
-    _sigma = res.x[2]
-    # calculate the new density curve
-    new_density = density - _amplitude * gaussian(time, _time, _sigma)
+    _time, _amplitude, _sigma = res.x
     # if adding the hotspot does not improve the fit, stop
     if res.fun > chisquare(density[idx]):
         return pd.DataFrame(columns=["time", "amplitude", "sigma"])
-    # show progress
-    if show_progress:
-        print("Residue:", chisquare(density))
+    # calculate the new density curve
+    new_density = density - _amplitude * gaussian(time, _time, _sigma)
     # return hotspots
     hotspots = pd.DataFrame([[_time, _amplitude, _sigma]], columns=["time", "amplitude", "sigma"])
     hotspots = pd.concat(
@@ -721,6 +677,10 @@ def get_hotspots(
     # if ended, show the figure using plotly
     if show_plot:
         # subsample density to speed up plotting
+        if len(density) < 2e5:
+            subsample = 4
+        else:
+            subsample = 16
         density = density[::subsample]
         time = time[::subsample]
         # remove unncessary points where density is zero
