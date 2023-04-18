@@ -1,4 +1,4 @@
-# hotspot-clips
+# hotspot-clip
 
 Using danmaku to find hotspot clips
 
