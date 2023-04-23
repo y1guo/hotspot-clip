@@ -146,6 +146,17 @@ class DanmakuPool:
                 return
             roomid = info.attrib["roomid"]
             start_time = parse_Bilirec_time(info.attrib["start_time"]).timestamp()
+            # old version of danmaku file might contain wrong start time, use filename instead
+            _ = file_path.split("/")[-1].split(roomid)[1]
+            start_time_from_filename = TIMEZONE.localize(
+                datetime.datetime.strptime(_[1:9] + _[10:16], "%Y%m%d%H%M%S")
+            ).timestamp()
+            if abs(start_time - start_time_from_filename) > 5:
+                start_time = start_time_from_filename
+                print(
+                    f"Warning: inconsistent start time in {file_path}, using time in filename instead."
+                )
+            # parse danmaku
             danmaku = {
                 "time": [],
                 "offset": [],
@@ -156,6 +167,7 @@ class DanmakuPool:
                 "price": [],
                 "text": [],
                 "weight": [],
+                "source": [],  #
             }
             for child in root.findall("d"):
                 p = child.attrib["p"].split(",")
@@ -168,7 +180,11 @@ class DanmakuPool:
                 danmaku["price"].append(0)
                 danmaku["text"].append(child.text if child.text else "")
                 danmaku["weight"].append(1)
+                danmaku["source"].append(file_path)  #
             for child in root.findall("sc"):
+                # old version of Bilirec does not have "uid" attribute
+                if "uid" not in child.attrib:
+                    continue
                 danmaku["time"].append(start_time + float(child.attrib["ts"]))
                 danmaku["offset"].append(0)
                 danmaku["roomid"].append(roomid)
@@ -178,6 +194,7 @@ class DanmakuPool:
                 danmaku["price"].append(int(child.attrib["price"]))
                 danmaku["text"].append(child.text if child.text else "")
                 danmaku["weight"].append(1)
+                danmaku["source"].append(file_path)  #
             self.df = pd.concat([self.df, pd.DataFrame(danmaku)], ignore_index=True)
             # print message if verbose
             if verbose:
@@ -200,7 +217,10 @@ class DanmakuPool:
                 print(f"{count:>6} {text}")
 
     def filter(
-        self, whitelist: list[Keyword] = None, blacklist: list[Keyword] = None, roomid: str = None
+        self,
+        whitelist: list[Keyword] = None,
+        blacklist: list[Keyword] = None,
+        roomid: str = None,
     ) -> DanmakuPool:
         """Filter danmaku in the pool.
 
@@ -221,9 +241,17 @@ class DanmakuPool:
         if roomid is not None:
             df = df[df["roomid"].eq(roomid)]
         if whitelist is not None:
-            df = df[df["text"].apply(lambda x: any([keyword.match(x) for keyword in whitelist]))]
+            df = df[
+                df["text"].apply(
+                    lambda x: any([keyword.match(x) for keyword in whitelist])
+                )
+            ]
         if blacklist is not None:
-            df = df[df["text"].apply(lambda x: not any([keyword.match(x) for keyword in blacklist]))]
+            df = df[
+                df["text"].apply(
+                    lambda x: not any([keyword.match(x) for keyword in blacklist])
+                )
+            ]
         return DanmakuPool(df)
 
     def segments(self) -> list[DanmakuPool]:
@@ -247,7 +275,9 @@ class DanmakuPool:
             seg.append(DanmakuPool(df.iloc[left:right]))
         return seg
 
-    def get_danmaku_density(self, roomid: str, kernel_sigma: float) -> tuple(np.ndarray, np.ndarray):
+    def get_danmaku_density(
+        self, roomid: str, kernel_sigma: float
+    ) -> tuple(np.ndarray, np.ndarray):
         """Get danmaku density for a room using Gaussian kernel.
 
         Parameters:
@@ -263,7 +293,10 @@ class DanmakuPool:
         """
         df = self.df[self.df["roomid"].eq(roomid)]
         if df.empty:
-            print(f"Warning: get_danmaku_density_gaussian: no danmaku found, roomid = {roomid}", file=sys.stderr)
+            print(
+                f"Warning: get_danmaku_density_gaussian: no danmaku found, roomid = {roomid}",
+                file=sys.stderr,
+            )
             return np.array([]), np.array([])
         start_time = df["time"].min()
         end_time = df["time"].max()
@@ -280,7 +313,9 @@ class DanmakuPool:
             )
         return time, density
 
-    def export_xml(self, roomid: str, start_time: float, end_time: float, file_path: str) -> None:
+    def export_xml(
+        self, roomid: str, start_time: float, end_time: float, file_path: str
+    ) -> None:
         """Export danmaku to an XML file.
 
         Parameters:
@@ -352,11 +387,22 @@ class VideoPool:
             # try to correct creation time for videos that were split afterwards
             try:
                 time_str = video_path.split(roomid + "_")[1][:15]
-                creation_time_from_filename = datetime.datetime.strptime(time_str, "%Y%m%d_%H%M%S")
-                creation_time_from_filename = TIMEZONE.localize(creation_time_from_filename)
-                if abs((creation_time_from_filename - creation_time).total_seconds()) > 1:
+                creation_time_from_filename = datetime.datetime.strptime(
+                    time_str, "%Y%m%d_%H%M%S"
+                )
+                creation_time_from_filename = TIMEZONE.localize(
+                    creation_time_from_filename
+                )
+                if (
+                    abs((creation_time_from_filename - creation_time).total_seconds())
+                    > 1
+                ):
                     creation_time = creation_time_from_filename
-                    print("Warning: add_video: corrected creation time, file =", video_path, file=sys.stderr)
+                    print(
+                        "Warning: add_video: corrected creation time, file =",
+                        video_path,
+                        file=sys.stderr,
+                    )
             except:
                 pass
             self.df = pd.concat(
@@ -377,7 +423,12 @@ class VideoPool:
             print("Error: add_video failed, file =", video_path, file=sys.stderr)
 
     def generate_clips(
-        self, roomid: str, clips: pd.DataFrame, out_dir: str, danmaku_pool: DanmakuPool = None, num_threads: int = 1
+        self,
+        roomid: str,
+        clips: pd.DataFrame,
+        out_dir: str,
+        danmaku_pool: DanmakuPool = None,
+        num_threads: int = 1,
     ) -> None:
         """Generate clips from the videos in the pool according to the clips information.
 
@@ -399,12 +450,18 @@ class VideoPool:
         """
         # if out_dir does not exist or  is not a directory, stop
         if not os.path.exists(out_dir) or not os.path.isdir(out_dir):
-            print(f"Error: generate_clips: out_dir does not exist, out_dir = {out_dir}", file=sys.stderr)
+            print(
+                f"Error: generate_clips: out_dir does not exist, out_dir = {out_dir}",
+                file=sys.stderr,
+            )
             return
         # find videos
         df = self.df[self.df["roomid"].eq(roomid)]
         if df.empty:
-            print(f"Warning: generate_clips: no video found, roomid = {roomid}", file=sys.stderr)
+            print(
+                f"Warning: generate_clips: no video found, roomid = {roomid}",
+                file=sys.stderr,
+            )
             return
         # generate clips
         args = []
@@ -432,8 +489,13 @@ class VideoPool:
                     args.append((video_path, ss, t, out_path))
                     # output danmaku xml file
                     if danmaku_pool is not None:
-                        print(f"Generating danmaku xml file: {out_path[:-4] + '.xml'}", flush=True)
-                        danmaku_pool.export_xml(roomid, actual_start, actual_end, out_path[:-4] + ".xml")
+                        print(
+                            f"Generating danmaku xml file: {out_path[:-4] + '.xml'}",
+                            flush=True,
+                        )
+                        danmaku_pool.export_xml(
+                            roomid, actual_start, actual_end, out_path[:-4] + ".xml"
+                        )
                     # update summary
                     summary = pd.concat(
                         [
@@ -450,10 +512,14 @@ class VideoPool:
         with mp.Pool(num_threads) as pool:
             pool.starmap(self._generate_clip_mp, args)
         # output summary
-        summary = summary.sort_values(by="amplitude", ascending=False).reset_index(drop=True)
+        summary = summary.sort_values(by="amplitude", ascending=False).reset_index(
+            drop=True
+        )
         summary.to_csv(os.path.join(out_dir, f"{roomid}_summary.csv"), index=False)
 
-    def _generate_clip_mp(self, video_path: str, ss: float, t: float, out_path: str) -> None:
+    def _generate_clip_mp(
+        self, video_path: str, ss: float, t: float, out_path: str
+    ) -> None:
         """Generate a clip using ffmpeg.
 
         Parameters:
@@ -468,7 +534,9 @@ class VideoPool:
         """
         print(f"Generating clip: {out_path}", flush=True)
         # generate the clip without re-encoding, overwrite
-        ffmpeg.input(video_path, ss=ss, t=t).output(out_path, vcodec="copy", acodec="copy").run_async(
+        ffmpeg.input(video_path, ss=ss, t=t).output(
+            out_path, vcodec="copy", acodec="copy"
+        ).run_async(
             overwrite_output=True,
             quiet=True,
         )
@@ -505,7 +573,9 @@ def get_video_creation_time(video_path: str) -> datetime.datetime or None:
                 break
         return creation_time
     except:
-        print("Error: get_video_creation_time failed, file =", video_path, file=sys.stderr)
+        print(
+            "Error: get_video_creation_time failed, file =", video_path, file=sys.stderr
+        )
         return None
 
 
@@ -585,9 +655,13 @@ def get_duration_inconsistency(video_path: str) -> tuple[float, float]:
         or xml_modification_time is None
         or video_duration == 0
     ):
-        print("Error: get_time_inconsistency failed, file =", video_path, file=sys.stderr)
+        print(
+            "Error: get_time_inconsistency failed, file =", video_path, file=sys.stderr
+        )
         return 0, 0
-    video_recording_duration = (video_modification_time - video_creation_time).total_seconds()
+    video_recording_duration = (
+        video_modification_time - video_creation_time
+    ).total_seconds()
     xml_recording_duration = (xml_modification_time - xml_creation_time).total_seconds()
     return (
         video_duration - xml_recording_duration,
@@ -658,7 +732,11 @@ def get_hotspots(
     res = minimize(
         objective,
         [_time, _amplitude, _sigma],
-        bounds=[(_time - 0.5 * _sigma, _time + 0.5 * _sigma), (_amplitude, _amplitude), (kernel_sigma, MAX_SIGMA)],
+        bounds=[
+            (_time - 0.5 * _sigma, _time + 0.5 * _sigma),
+            (_amplitude, _amplitude),
+            (kernel_sigma, MAX_SIGMA),
+        ],
         args=(idx,),
         method="Nelder-Mead",
     )
@@ -669,9 +747,20 @@ def get_hotspots(
     # calculate the new density curve
     new_density = density - _amplitude * gaussian(time, _time, _sigma)
     # return hotspots
-    hotspots = pd.DataFrame([[_time, _amplitude, _sigma]], columns=["time", "amplitude", "sigma"])
+    hotspots = pd.DataFrame(
+        [[_time, _amplitude, _sigma]], columns=["time", "amplitude", "sigma"]
+    )
     hotspots = pd.concat(
-        [hotspots, get_hotspots(time, new_density, kernel_sigma, max_hotspots - 1, show_progress=show_progress)],
+        [
+            hotspots,
+            get_hotspots(
+                time,
+                new_density,
+                kernel_sigma,
+                max_hotspots - 1,
+                show_progress=show_progress,
+            ),
+        ],
         ignore_index=True,
     )
     # if ended, show the figure using plotly
@@ -688,7 +777,13 @@ def get_hotspots(
         time = time[idx]
         density = density[idx]
         # create a figure with two subplots, let the right one 1/4 of the width of the left one
-        fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[9, 1], horizontal_spacing=0)
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            shared_yaxes=True,
+            column_widths=[9, 1],
+            horizontal_spacing=0,
+        )
         fig.add_trace(
             go.Scatter(
                 x=[datetime.datetime.fromtimestamp(_).isoformat() for _ in time],
@@ -701,11 +796,16 @@ def get_hotspots(
             col=1,
         )
         for _, row in hotspots.iterrows():
-            idx = (time >= row["time"] - 3 * row["sigma"]) & (time <= row["time"] + 3 * row["sigma"])
+            idx = (time >= row["time"] - 3 * row["sigma"]) & (
+                time <= row["time"] + 3 * row["sigma"]
+            )
             # set the color of the hotspot to orange and hide the labels
             fig.add_trace(
                 go.Scatter(
-                    x=[datetime.datetime.fromtimestamp(_).isoformat() for _ in time[idx]],
+                    x=[
+                        datetime.datetime.fromtimestamp(_).isoformat()
+                        for _ in time[idx]
+                    ],
                     y=gaussian(time[idx], row["time"], row["sigma"]) * row["amplitude"],
                     mode="lines",
                     name="hotspot",
@@ -764,7 +864,9 @@ def get_hotspots(
             col=2,
         )
         # move the legend on top of the figure, in the center, show in horizontal direction
-        fig.update_layout(legend=dict(xanchor="center", yanchor="bottom", x=0.5, y=1, orientation="h"))
+        fig.update_layout(
+            legend=dict(xanchor="center", yanchor="bottom", x=0.5, y=1, orientation="h")
+        )
         # reduce the margin of the figure
         fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
         # show the figure
@@ -772,7 +874,9 @@ def get_hotspots(
     return hotspots
 
 
-def get_clips(hotspots: pd.DataFrame, percentile: float = 0, threshold: float = 0, num: int = 0) -> pd.DataFrame:
+def get_clips(
+    hotspots: pd.DataFrame, percentile: float = 0, threshold: float = 0, num: int = 0
+) -> pd.DataFrame:
     """Get the start and end time of the clips.
 
     Parameters:
@@ -794,7 +898,9 @@ def get_clips(hotspots: pd.DataFrame, percentile: float = 0, threshold: float = 
     """
     # select the hotspots with the amplitudes higher than the percentile
     if percentile > 0:
-        hotspots = hotspots[hotspots["amplitude"] >= hotspots["amplitude"].quantile(percentile)]
+        hotspots = hotspots[
+            hotspots["amplitude"] >= hotspots["amplitude"].quantile(percentile)
+        ]
     # select the hotspots with the amplitudes higher than the threshold
     if threshold > 0:
         hotspots = hotspots[hotspots["amplitude"] >= threshold]
@@ -810,14 +916,24 @@ def get_clips(hotspots: pd.DataFrame, percentile: float = 0, threshold: float = 
         end = row["time"] + 2 * row["sigma"] + TIME_AFTERWARD
         amplitude = row["amplitude"]
         if clips.empty:
-            clips = pd.DataFrame([[start, end, amplitude]], columns=["start", "end", "amplitude"])
+            clips = pd.DataFrame(
+                [[start, end, amplitude]], columns=["start", "end", "amplitude"]
+            )
         else:
             if start <= clips.iloc[-1]["end"]:
                 clips.iloc[-1]["end"] = end
-                clips.iloc[-1]["amplitude"] = max(clips.iloc[-1]["amplitude"], amplitude)
+                clips.iloc[-1]["amplitude"] = max(
+                    clips.iloc[-1]["amplitude"], amplitude
+                )
             else:
                 clips = pd.concat(
-                    [clips, pd.DataFrame([[start, end, amplitude]], columns=["start", "end", "amplitude"])],
+                    [
+                        clips,
+                        pd.DataFrame(
+                            [[start, end, amplitude]],
+                            columns=["start", "end", "amplitude"],
+                        ),
+                    ],
                     ignore_index=True,
                 )
     # sammary message
